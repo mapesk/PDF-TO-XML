@@ -1,0 +1,1054 @@
+import os
+import time
+import sqlite3
+from datetime import datetime, date
+from typing import List, Dict, Tuple, Optional
+
+import pandas as pd
+import customtkinter as ctk
+from tkinter import ttk, messagebox
+
+from watchdog.observers import Observer
+from watchdog.events import FileSystemEventHandler
+
+from reportlab.lib.pagesizes import A4, landscape
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
+from reportlab.pdfgen import canvas
+
+import sys
+
+
+def get_base_dir():
+    if getattr(sys, 'frozen', False):
+        # EXE çalışıyorsa → exe'nin olduğu klasör
+        return os.path.dirname(sys.executable)
+    else:
+        # Python dosyası çalışıyorsa
+        return os.path.abspath(os.path.dirname(__file__))
+
+BASE_DIR = get_base_dir()
+
+# -----------------------------
+# AYARLAR
+# -----------------------------
+APP_TITLE = "AGER Üretim Takip"
+PASSWORD = "123"
+AUTO_REFRESH_MS = 5000
+ONLY_STOK_PREFIX = "10-"
+
+DB_PATH = os.path.join(BASE_DIR, "ager.db")
+EXCEL_DIR = os.path.join(BASE_DIR, "gelen_exeller")
+ARCHIVE_DIR = os.path.join(BASE_DIR, "arsiv")
+
+os.makedirs(EXCEL_DIR, exist_ok=True)
+os.makedirs(ARCHIVE_DIR, exist_ok=True)
+
+# =============================
+# ORTAK SERVER KLASÖR AYARI
+# =============================
+
+
+
+
+
+
+
+
+
+
+# Excel kolon eşleşmeleri (senin dosyana göre)
+COLMAP = {
+    "Cari Adı": "cari_adi",
+    "Sevk tarihi": "sevk_tarihi",
+    "Sipariş no": "siparis_no",
+    "Stok Kodu": "stok_kodu",
+    "Stok Adı": "stok_adi",
+    "Toplam MRP MİKTAR": "adet",
+    "Üretime Verildiği Tarih": "uretime_verildigi_tarih",
+}
+
+
+# -----------------------------
+# DB KATMANI (SQLite)
+# Multi-PC için: WAL + timeout
+# -----------------------------
+def db_connect() -> sqlite3.Connection:
+    con = sqlite3.connect(DB_PATH, timeout=10, check_same_thread=False)
+    con.execute("PRAGMA journal_mode=WAL;")
+    con.execute("PRAGMA synchronous=NORMAL;")
+    con.execute("PRAGMA foreign_keys=ON;")
+    return con
+
+
+def db_init():
+    con = db_connect()
+    try:
+        con.execute(
+            """
+            CREATE TABLE IF NOT EXISTS items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                cari_adi TEXT,
+                sevk_tarihi TEXT,
+                siparis_no TEXT NOT NULL,
+                stok_kodu TEXT NOT NULL,
+                stok_adi TEXT,
+                adet INTEGER,
+                lazer_yapildi INTEGER DEFAULT 0,
+                punch_yapildi INTEGER DEFAULT 0,
+                yapan_adsoyad TEXT,
+                yapilan_makine TEXT,
+                yapilan_zaman TEXT,
+                UNIQUE(siparis_no, stok_kodu)
+            );
+            """
+        )  
+     
+
+        con.commit()
+    finally:
+        con.close()
+
+
+def upsert_items(rows: List[Dict]):
+    """
+    Excel'den gelen satırları DB'ye yazar.
+    Aynı sipariş_no + stok_kodu gelirse cari/sevk/adet/stok_adi günceller.
+    Yapıldı bilgilerini ellemez.
+    """
+    con = db_connect()
+    try:
+        cur = con.cursor()
+        for r in rows:
+            sip = (r.get("siparis_no") or "").strip()
+            stok = (r.get("stok_kodu") or "").strip()
+
+            # SADECE 10- ile başlayan stoklar
+            if not stok.startswith(ONLY_STOK_PREFIX):
+                continue
+
+            if not sip or not stok:
+                continue
+
+            cur.execute(
+                """
+                INSERT INTO items (cari_adi, sevk_tarihi, siparis_no, stok_kodu, stok_adi, adet)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(siparis_no, stok_kodu) DO UPDATE SET
+                    cari_adi=excluded.cari_adi,
+                    sevk_tarihi=excluded.sevk_tarihi,
+                    stok_adi=excluded.stok_adi,
+                    adet=excluded.adet
+                ;
+                """,
+                (
+                    r.get("cari_adi"),
+                    r.get("sevk_tarihi"),
+                    sip,
+                    stok,
+                    r.get("stok_adi"),
+                    r.get("adet"),
+                ),
+            )
+        con.commit()
+    finally:
+        con.close()
+
+
+def fetch_items() -> List[Dict]:
+    con = db_connect()
+    try:
+        cur = con.cursor()
+        # SADECE 10- ile başlayan stoklar çekilsin
+        cur.execute(
+            """
+            SELECT
+                cari_adi, sevk_tarihi, siparis_no, stok_kodu, stok_adi, adet,
+                lazer_yapildi, punch_yapildi, yapan_adsoyad, yapilan_makine, yapilan_zaman
+            FROM items
+            WHERE stok_kodu LIKE ?
+            """,
+            (f"{ONLY_STOK_PREFIX}%",),
+        )
+        out = []
+        for row in cur.fetchall():
+            out.append(
+                {
+                    "cari_adi": row[0] or "",
+                    "sevk_tarihi": row[1] or "",
+                    "siparis_no": row[2] or "",
+                    "stok_kodu": row[3] or "",
+                    "stok_adi": row[4] or "",
+                    "adet": row[5],
+                    "lazer_yapildi": bool(row[6]),
+                    "punch_yapildi": bool(row[7]),
+                    "yapan_adsoyad": row[8] or "",
+                    "yapilan_makine": row[9] or "",
+                    "yapilan_zaman": row[10] or "",
+                }
+            )
+
+        # Sevk tarihine göre sırala (boşlar en sona)
+        def sort_key(x):
+            s = x["sevk_tarihi"]
+            return (s == "", s)
+
+        out.sort(key=sort_key)
+        return out
+    finally:
+        con.close()
+
+
+def tick_item(siparis_no: str, stok_kodu: str, user_fullname: str, machine: str) -> Tuple[bool, str]:
+    """
+    Kural: aynı anda lazer+punch olmaz.
+    machine "LAZER" ise lazer=1, punch=0 yapar. "PUNCH" ise tersi.
+    Zaten yapılmışsa ikinci kez yazmaz. (Geri alma ayrı fonksiyon)
+    """
+    machine = machine.upper().strip()
+    if machine not in ("LAZER", "PUNCH"):
+        return False, "Makine türü hatalı."
+
+    con = db_connect()
+    try:
+        cur = con.cursor()
+        cur.execute(
+            """
+            SELECT lazer_yapildi, punch_yapildi
+            FROM items
+            WHERE siparis_no=? AND stok_kodu=?
+            """,
+            (siparis_no, stok_kodu),
+        )
+        row = cur.fetchone()
+        if not row:
+            return False, "Kayıt bulunamadı."
+
+        lazer_yapildi, punch_yapildi = bool(row[0]), bool(row[1])
+        if lazer_yapildi or punch_yapildi:
+            return False, "Bu satır zaten işaretlenmiş."
+
+        now = datetime.now().isoformat(timespec="seconds")
+        if machine == "LAZER":
+            cur.execute(
+                """
+                UPDATE items
+                SET lazer_yapildi=1, punch_yapildi=0,
+                    yapan_adsoyad=?, yapilan_makine=?, yapilan_zaman=?
+                WHERE siparis_no=? AND stok_kodu=?
+                """,
+                (user_fullname, machine, now, siparis_no, stok_kodu),
+            )
+        else:
+            cur.execute(
+                """
+                UPDATE items
+                SET punch_yapildi=1, lazer_yapildi=0,
+                    yapan_adsoyad=?, yapilan_makine=?, yapilan_zaman=?
+                WHERE siparis_no=? AND stok_kodu=?
+                """,
+                (user_fullname, machine, now, siparis_no, stok_kodu),
+            )
+        con.commit()
+        return True, "OK"
+    finally:
+        con.close()
+
+
+def get_item_done_status(siparis_no: str, stok_kodu: str) -> Tuple[bool, str]:
+    """Satır işaretli mi? İşaretliyse hangi makine?"""
+    con = db_connect()
+    try:
+        cur = con.cursor()
+        cur.execute(
+            """
+            SELECT lazer_yapildi, punch_yapildi, yapilan_makine, yapan_adsoyad, yapilan_zaman
+            FROM items
+            WHERE siparis_no=? AND stok_kodu=?
+            """,
+            (siparis_no, stok_kodu),
+        )
+        row = cur.fetchone()
+        if not row:
+            return False, ""
+        lazer, punch = bool(row[0]), bool(row[1])
+        if lazer or punch:
+            return True, (row[2] or "")
+        return False, ""
+    finally:
+        con.close()
+
+
+def undo_item(siparis_no: str, stok_kodu: str) -> None:
+    """Yanlış işaretleme geri alma."""
+    con = db_connect()
+    try:
+        con.execute(
+            """
+            UPDATE items
+            SET lazer_yapildi=0,
+                punch_yapildi=0,
+                yapan_adsoyad=NULL,
+                yapilan_makine=NULL,
+                yapilan_zaman=NULL
+            WHERE siparis_no=? AND stok_kodu=?
+            """,
+            (siparis_no, stok_kodu),
+        )
+        con.commit()
+    finally:
+        con.close()
+
+
+# -----------------------------
+# EXCEL OKUMA
+# -----------------------------
+def normalize_df(df: pd.DataFrame) -> pd.DataFrame:
+    colmap = {}
+    for c in df.columns:
+        c2 = str(c).strip()
+        colmap[c] = COLMAP.get(c2, c2)
+    return df.rename(columns=colmap)
+
+
+def to_iso_date(val) -> str:
+    if val is None or (isinstance(val, float) and pd.isna(val)):
+        return ""
+    try:
+        dt = pd.to_datetime(val)
+        return dt.date().isoformat()
+    except Exception:
+        return ""
+
+
+def import_excel_file(path: str) -> Tuple[bool, str]:
+    for _ in range(5):
+        try:
+            df = pd.read_excel(path)
+            break
+        except Exception:
+            time.sleep(0.4)
+    else:
+        return False, f"Excel okunamadı: {os.path.basename(path)}"
+
+    df = normalize_df(df)
+
+    required = ["siparis_no", "stok_kodu"]
+    for r in required:
+        if r not in df.columns:
+            return False, f"Gerekli kolon yok: {r}"
+
+    rows = []
+    for _, r in df.iterrows():
+        sip = str(r.get("siparis_no", "")).strip()
+        stok = str(r.get("stok_kodu", "")).strip()
+
+        # SADECE 10- ile başlayan stoklar içe alınsın
+        if not stok.startswith(ONLY_STOK_PREFIX):
+            continue
+
+        if not sip or not stok:
+            continue
+
+        rows.append(
+            {
+                "cari_adi": str(r.get("cari_adi", "")).strip(),
+                "sevk_tarihi": to_iso_date(r.get("sevk_tarihi", None)),
+                "siparis_no": sip,
+                "stok_kodu": stok,
+                "stok_adi": str(r.get("stok_adi", "")).strip(),
+                "adet": int(r.get("adet")) if pd.notna(r.get("adet")) else None,
+            }
+        )
+
+    upsert_items(rows)
+    return True, f"İçe aktarıldı: {os.path.basename(path)}"
+
+
+# -----------------------------
+# WATCHDOG - Excel klasörü izleme
+# -----------------------------
+class ExcelWatchHandler(FileSystemEventHandler):
+    def __init__(self, on_import_callback):
+        super().__init__()
+        self.on_import_callback = on_import_callback
+
+    def on_created(self, event):
+        if event.is_directory:
+            return
+        if not event.src_path.lower().endswith((".xlsx", ".xls")):
+            return
+        ok, msg = import_excel_file(event.src_path)
+        self.on_import_callback(ok, msg)
+
+
+def start_excel_watcher(on_import_callback):
+    handler = ExcelWatchHandler(on_import_callback)
+    observer = Observer()
+    observer.daemon = True
+    observer.schedule(handler, EXCEL_DIR, recursive=False)
+    observer.start()
+    return observer
+
+
+# -----------------------------
+# PDF YAZDIRMA (YATAY + TR)
+# -----------------------------
+def ensure_fonts() -> Tuple[str, str]:
+    """
+    Türkçe karakter için font kaydı.
+    Önce Arial (normal + bold) dener, yoksa Segoe UI dener.
+    """
+    win_fonts = os.path.join(os.environ.get("WINDIR", "C:\\Windows"), "Fonts")
+    candidates = [
+        (os.path.join(win_fonts, "arial.ttf"), os.path.join(win_fonts, "arialbd.ttf")),
+        (os.path.join(win_fonts, "segoeui.ttf"), os.path.join(win_fonts, "segoeuib.ttf")),
+        (os.path.join(win_fonts, "calibri.ttf"), os.path.join(win_fonts, "calibrib.ttf")),
+    ]
+
+    for reg, bold in candidates:
+        if os.path.exists(reg) and os.path.exists(bold):
+            pdfmetrics.registerFont(TTFont("AGER_REG", reg))
+            pdfmetrics.registerFont(TTFont("AGER_BOLD", bold))
+            return "AGER_REG", "AGER_BOLD"
+
+    # fallback: Helvetica (TR’de sorun çıkarsa Windows fontlarını kontrol et)
+    return "Helvetica", "Helvetica-Bold"
+
+
+def export_pdf(pdf_path: str, title: str, subtitle: str, rows: List[Dict]):
+    reg, bold = ensure_fonts()
+    c = canvas.Canvas(pdf_path, pagesize=landscape(A4))
+    w, h = landscape(A4)
+
+    # Başlık
+    c.setFont(bold, 26)
+    c.drawCentredString(w / 2, h - 45, "AGER")
+
+    c.setFont(reg, 10)
+    c.drawCentredString(w / 2, h - 65, title)
+    c.drawCentredString(w / 2, h - 80, subtitle)
+
+    # Tablo başlıkları
+    y = h - 110
+    c.setFont(bold, 11)
+
+    # Kolon konumları (landscape için)
+    x_cari = 30
+    x_sevk = 210
+    x_sip = 300
+    x_stok = 400
+    x_adet = 545
+    x_durum = 610
+    x_yapan = 710
+
+    c.drawString(x_cari, y, "Cari")
+    c.drawString(x_sevk, y, "Sevk")
+    c.drawString(x_sip, y, "Sipariş No")
+    c.drawString(x_stok, y, "Stok Kodu")
+    c.drawRightString(x_adet, y, "Adet")
+    c.drawString(x_durum, y, "Durum")
+    c.drawString(x_yapan, y, "Yapan")
+
+    y -= 10
+    c.line(30, y, w - 30, y)
+    y -= 16
+
+    c.setFont(reg, 10)
+    for r in rows:
+        if y < 40:
+            c.showPage()
+            y = h - 50
+            c.setFont(reg, 10)
+
+        durum = "BEKLİYOR"
+        if r.get("lazer_yapildi"):
+            durum = "LAZER ✓"
+        elif r.get("punch_yapildi"):
+            durum = "PUNCH ✓"
+
+        c.drawString(x_cari, y, (r.get("cari_adi") or "")[:28])
+        c.drawString(x_sevk, y, (r.get("sevk_tarihi") or "")[:10])
+        c.drawString(x_sip, y, (r.get("siparis_no") or "")[:14])
+        c.drawString(x_stok, y, (r.get("stok_kodu") or "")[:22])
+
+        adet = r.get("adet")
+        c.drawRightString(x_adet, y, str(adet) if adet is not None else "")
+
+        c.drawString(x_durum, y, durum)
+        c.drawString(x_yapan, y, (r.get("yapan_adsoyad") or "")[:22])
+
+        y -= 15
+
+    c.save()
+
+
+# -----------------------------
+# UI - Ticker (kayan yazı)
+# -----------------------------
+class Ticker(ctk.CTkCanvas):
+    def __init__(self, master, height=28):
+        super().__init__(master, height=height, highlightthickness=0)
+        self.text_id = None
+        self.speed = 2
+        self.msg = ""
+        self._job = None
+
+    def set_message(self, msg: str):
+        self.msg = msg if msg else ""
+        self.delete("all")
+        start_x = self.winfo_width() if self.winfo_width() > 0 else 900
+        self.text_id = self.create_text(
+            start_x, 14, anchor="w", text=self.msg, font=("Segoe UI", 12, "bold")
+        )
+        if self._job:
+            self.after_cancel(self._job)
+        self._animate()
+
+    def _animate(self):
+        if not self.text_id:
+            return
+        self.move(self.text_id, -self.speed, 0)
+        bbox = self.bbox(self.text_id)
+        if bbox and bbox[2] < 0:
+            self.coords(self.text_id, self.winfo_width(), 14)
+        self._job = self.after(20, self._animate)
+
+
+# -----------------------------
+# UI - Login
+# -----------------------------
+class LoginView(ctk.CTkFrame):
+    def __init__(self, master, on_login):
+        super().__init__(master)
+        self.on_login = on_login
+        self.grid_columnconfigure(0, weight=1)
+
+        ctk.CTkLabel(self, text="AGER", font=ctk.CTkFont(size=36, weight="bold")).grid(
+            row=0, column=0, padx=20, pady=(30, 8)
+        )
+        ctk.CTkLabel(self, text="Üretim Takip Sistemi", font=ctk.CTkFont(size=14)).grid(
+            row=1, column=0, padx=20, pady=(0, 20)
+        )
+
+        form = ctk.CTkFrame(self, corner_radius=16)
+        form.grid(row=2, column=0, padx=20, pady=10, sticky="ew")
+        form.grid_columnconfigure(1, weight=1)
+
+        ctk.CTkLabel(form, text="Ad").grid(row=0, column=0, padx=12, pady=10, sticky="w")
+        self.ent_ad = ctk.CTkEntry(form, placeholder_text="Örn: Ali")
+        self.ent_ad.grid(row=0, column=1, padx=12, pady=10, sticky="ew")
+
+        ctk.CTkLabel(form, text="Soyad").grid(row=1, column=0, padx=12, pady=10, sticky="w")
+        self.ent_soyad = ctk.CTkEntry(form, placeholder_text="Örn: Yılmaz")
+        self.ent_soyad.grid(row=1, column=1, padx=12, pady=10, sticky="ew")
+
+        ctk.CTkLabel(form, text="Rol").grid(row=2, column=0, padx=12, pady=10, sticky="w")
+        self.role = ctk.CTkOptionMenu(form, values=["LAZER", "PUNCH", "GÖZLEMCİ"])
+        self.role.grid(row=2, column=1, padx=12, pady=10, sticky="ew")
+        self.role.set("LAZER")
+        self.role.configure(command=self._role_changed)
+
+        ctk.CTkLabel(form, text="Şifre").grid(row=3, column=0, padx=12, pady=10, sticky="w")
+        self.ent_pwd = ctk.CTkEntry(form, show="*", placeholder_text="Operatör için 123")
+        self.ent_pwd.grid(row=3, column=1, padx=12, pady=10, sticky="ew")
+
+        self._role_changed("LAZER")
+
+        ctk.CTkButton(self, text="Giriş Yap", height=42, command=self._login).grid(
+            row=3, column=0, padx=20, pady=(18, 28), sticky="ew"
+        )
+
+    def _role_changed(self, role):
+        if role == "GÖZLEMCİ":
+            self.ent_pwd.configure(state="disabled")
+        else:
+            self.ent_pwd.configure(state="normal")
+
+    def _login(self):
+        ad = self.ent_ad.get().strip()
+        soyad = self.ent_soyad.get().strip()
+        role = self.role.get().strip()
+        pwd = self.ent_pwd.get().strip()
+
+        if not ad or not soyad:
+            messagebox.showerror("Hata", "Ad ve Soyad zorunlu.")
+            return
+
+        if role in ("LAZER", "PUNCH"):
+            if pwd != PASSWORD:
+                messagebox.showerror("Hata", "Şifre yanlış.")
+                return
+
+        self.on_login(f"{ad} {soyad}", role)
+
+
+# -----------------------------
+# UI - Main
+# -----------------------------
+class MainView(ctk.CTkFrame):
+    def __init__(self, master, user_fullname: str, role: str):
+        super().__init__(master)
+        self.user_fullname = user_fullname
+        self.role = role
+        self.read_only = (role == "GÖZLEMCİ")
+
+        # ✅ EKSİK OLAN: açıklama sözlüğü (yoksa render_table patlar)
+        self.aciklamalar: Dict[Tuple[str, str], str] = {}
+
+        self.items_cache: List[Dict] = []
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(3, weight=8)
+
+        # Header
+        header = ctk.CTkFrame(self, corner_radius=18)
+        header.grid(row=0, column=0, padx=16, pady=(16, 8), sticky="ew")
+        header.grid_columnconfigure(0, weight=1)  # sol
+        header.grid_columnconfigure(1, weight=1)  # sağ
+
+        ctk.CTkLabel(header, text="AGER", font=ctk.CTkFont(size=28, weight="bold")).grid(
+            row=0, column=0, padx=14, pady=(12, 0), sticky="w"
+        )
+        ctk.CTkLabel(header, text="Bugünün Sevkleri", font=ctk.CTkFont(size=12)).grid(
+            row=1, column=0, padx=14, pady=(0, 4), sticky="w"
+        )
+
+        self.ticker = Ticker(header, height=30)
+        self.ticker.grid(row=2, column=0, padx=12, pady=(0, 12), sticky="ew")
+
+        # Toolbar (ENLEME BÜYÜTME: columnconfigure ayarları)
+        tools = ctk.CTkFrame(self, corner_radius=18)
+        tools.grid(row=1, column=0, padx=16, pady=8, sticky="ew")
+
+        # 0: Filtre label, 1: filtre menu, 2: arama, 3: yenile, 4: yazdır
+        tools.grid_columnconfigure(2, weight=3)  # arama daha geniş
+        tools.grid_columnconfigure(1, weight=0)
+
+        ctk.CTkLabel(tools, text="Filtre").grid(row=0, column=0, padx=(12, 6), pady=10)
+        self.cmb_filter = ctk.CTkOptionMenu(
+            tools,
+            values=["TÜMÜ", "BUGÜN", "GECİKEN", "BEKLİYOR", "YAPILDI"],
+            command=lambda _: self.render_table(),
+        )
+        self.cmb_filter.grid(row=0, column=1, padx=(0, 10), pady=10, sticky="w")
+        self.cmb_filter.set("TÜMÜ")
+
+        self.search = ctk.CTkEntry(tools, placeholder_text="Ara: cari / sipariş no / stok kodu")
+        self.search.grid(row=0, column=2, padx=10, pady=10, sticky="ew")
+        self.search.bind("<KeyRelease>", lambda e: self.render_table())
+
+        self.btn_refresh = ctk.CTkButton(tools, text="Yenile", width=110, command=self.refresh_now)
+        self.btn_refresh.grid(row=0, column=3, padx=(0, 10), pady=10)
+
+        self.btn_print = ctk.CTkButton(
+            tools, text="Yazdır", width=110,
+            state=("disabled" if self.read_only else "normal"),
+            command=self.print_pdf
+        )
+        self.btn_print.grid(row=0, column=4, padx=(0, 12), pady=10)
+
+        # Table
+        wrap = ctk.CTkFrame(self, corner_radius=18)
+        wrap.grid(row=3, column=0, padx=16, pady=(8, 8), sticky="nsew")
+        wrap.grid_rowconfigure(0, weight=3)
+        wrap.grid_columnconfigure(0, weight=1)
+
+        # EXCEL gibi görünüm ayarları (ızgara hissi + satır yüksekliği)
+        style = ttk.Style()
+        style.theme_use("clam")
+
+        style.configure(
+            "Treeview.Heading",
+            font=("Segoe UI", 10, "bold"),
+            background="#2b2b2b",
+            foreground="white",
+            relief="raised"
+        )
+        style.configure(
+            "Treeview.Heading",
+            font=("Segoe UI", 10, "bold")
+        )
+
+        # Kolonlar (çok değiştirmeden)
+        cols = ("cari", "sevk", "siparis", "stok", "stokadi", "adet", "aciklama", "durum", "yapan")
+
+        self.tree = ttk.Treeview(wrap, columns=cols, show="headings", height=22)
+        self.tree.grid(row=0, column=0, padx=(12, 0), pady=12, sticky="nsew")
+
+        # VS Code koyu tema renkleri
+        self.tree.tag_configure(
+            "evenrow",
+            background="#1e1e1e",  # VS Code ana arka plan
+            foreground="white"
+        )
+
+        self.tree.tag_configure(
+            "oddrow",
+            background="#252526",  # VS Code satır farkı
+            foreground="white"
+        )
+
+        # Yapıldı (yeşil)
+        self.tree.tag_configure(
+            "done",
+            background="#2d4f3a",  # VS Code uyumlu koyu yeşil
+            foreground="white"
+        )
+
+        # DİKEY SCROLLBAR (Excel gibi "neredeyim" barı)
+        v_scroll = ttk.Scrollbar(wrap, orient="vertical", command=self.tree.yview)
+        v_scroll.grid(row=0, column=1, sticky="ns", pady=12, padx=(8, 12))
+        self.tree.configure(yscrollcommand=v_scroll.set)
+
+        headings = {
+            "cari": "Cari",
+            "sevk": "Sevk",
+            "siparis": "Sipariş No",
+            "stok": "Stok Kodu",
+            "stokadi": "Stok Adı",
+            "adet": "Adet",
+            "aciklama": "Açıklama",
+            "durum": "Durum",
+            "yapan": "Yapan",
+        }
+
+        for k, v in headings.items():
+            self.tree.heading(k, text=v)
+
+        # Genişlikler (yatay scroll yaratmamak için makul)
+        self.tree.column("cari", width=210)
+        self.tree.column("sevk", width=95)
+        self.tree.column("siparis", width=110)
+        self.tree.column("stok", width=150)
+        self.tree.column("stokadi", width=260)
+        self.tree.column("adet", width=65, anchor="center")
+        self.tree.column("durum", width=110, anchor="center")
+        self.tree.column("yapan", width=170)
+        self.tree.column("aciklama", width=260)
+        self.tree.bind("<Double-1>", self.on_double_click)
+
+        stamp = datetime.now().strftime("%d.%m.%Y %H:%M")
+        user_info = f"{self.user_fullname} | {self.role} | {stamp}"
+
+        ctk.CTkLabel(
+            header,
+            text=user_info,
+            font=ctk.CTkFont(size=12, weight="bold")
+        ).grid(
+            row=0,
+            column=1,
+            padx=14,
+            pady=(12, 0),
+            sticky="e"
+        )
+
+        # İlk yükleme + otomatik yenileme
+        self.refresh_now()
+        self.after(AUTO_REFRESH_MS, self.auto_refresh)
+
+    def auto_refresh(self):
+        self.refresh_now(silent=True)
+        self.after(AUTO_REFRESH_MS, self.auto_refresh)
+
+    def refresh_now(self, silent: bool = False):
+        try:
+            self.items_cache = fetch_items()
+            self.render_table()
+            self.render_ticker()
+        except Exception as e:
+            if not silent:
+                messagebox.showerror("Hata", f"Veri okunamadı.\n{e}")
+
+    def apply_filter(self, rows: List[Dict]) -> List[Dict]:
+        f = self.cmb_filter.get()
+        today = date.today().isoformat()
+
+        def done(r):
+            return r["lazer_yapildi"] or r["punch_yapildi"]
+
+        out = []
+        for r in rows:
+            sevk = r["sevk_tarihi"]
+            if f == "BUGÜN" and sevk != today:
+                continue
+            if f == "GECİKEN" and not (sevk != "" and sevk < today):
+                continue
+            if f == "BEKLİYOR" and done(r):
+                continue
+            if f == "YAPILDI" and not done(r):
+                continue
+            out.append(r)
+        return out
+
+    def print_pdf(self):
+        selected = self.tree.selection()
+        rows = []
+
+        index = {(r["siparis_no"], r["stok_kodu"]): r for r in self.items_cache}
+
+        if selected:
+            for sid in selected:
+                vals = self.tree.item(sid, "values")
+                if len(vals) >= 4:
+                    key = (vals[2], vals[3])
+                    if key in index:
+                        rows.append(index[key])
+        else:
+            q = self.search.get().strip().lower()
+            for r in self.apply_filter(self.items_cache):
+                hay = f'{r["cari_adi"]} {r["siparis_no"]} {r["stok_kodu"]}'.lower()
+                if q and q not in hay:
+                    continue
+                rows.append(r)
+
+        if not rows:
+            messagebox.showinfo("Yazdır", "Yazdırılacak veri yok.")
+            return
+
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        pdf_path = os.path.join(ARCHIVE_DIR, f"AGER_YAZDIR_{ts}.pdf")
+
+        title = f"Programcı: {self.user_fullname}    Makine: {self.role}"
+        subtitle = f"Tarih: {datetime.now().strftime('%d.%m.%Y %H:%M')}"
+
+        try:
+            export_pdf(pdf_path, title, subtitle, rows)
+            try:
+                os.startfile(pdf_path)
+            except Exception:
+                pass
+            messagebox.showinfo("Yazdır", f"PDF oluşturuldu:\n{pdf_path}")
+        except Exception as e:
+            messagebox.showerror("Hata", f"PDF oluşturulamadı.\n{e}")
+
+    def render_table(self):
+        self.tree.delete(*self.tree.get_children())
+
+        q = self.search.get().strip().lower()
+        rows = self.apply_filter(self.items_cache)
+
+        for i, r in enumerate(rows):
+            hay = f'{r["cari_adi"]} {r["siparis_no"]} {r["stok_kodu"]}'.lower()
+            if q and q not in hay:
+                continue
+
+            if r["lazer_yapildi"]:
+                durum = "LAZER ✓"
+            elif r["punch_yapildi"]:
+                durum = "PUNCH ✓"
+            else:
+                durum = "BEKLİYOR"
+
+            key = (r["siparis_no"], r["stok_kodu"])
+            aciklama = self.aciklamalar.get(key, "")
+
+            tag = "done" if (r["lazer_yapildi"] or r["punch_yapildi"]) else (
+                "evenrow" if i % 2 == 0 else "oddrow"
+            )
+
+            self.tree.insert(
+                "",
+                "end",
+                values=(
+                    r["cari_adi"],
+                    r["sevk_tarihi"],
+                    r["siparis_no"],
+                    r["stok_kodu"],
+                    r["stok_adi"],
+                    "" if r["adet"] is None else r["adet"],
+                    "✏ " + aciklama if aciklama else "✏ Açıklama",
+                    durum,
+                    r["yapan_adsoyad"],
+                ),
+                tags=(tag,)
+            )
+
+        # 🔔 Ticker için uyarı listesi
+
+    def build_alert_list(self) -> List[str]:
+        today = date.today().isoformat()
+
+        by_sip: Dict[str, List[Dict]] = {}
+        for r in self.items_cache:
+            by_sip.setdefault(r["siparis_no"], []).append(r)
+
+        def done(x):
+            return x["lazer_yapildi"] or x["punch_yapildi"]
+
+        alerts: List[str] = []
+        seen = set()
+
+        for sip, rows in by_sip.items():
+            cari = rows[0]["cari_adi"].strip() or sip
+
+            if any(r["sevk_tarihi"] == today for r in rows) and any(not done(r) for r in rows):
+                if cari not in seen:
+                    alerts.append(f"🚚 BUGÜN: {cari}")
+                    seen.add(cari)
+                continue
+
+            if any(r["sevk_tarihi"] and r["sevk_tarihi"] < today for r in rows) and any(not done(r) for r in rows):
+                if cari not in seen:
+                    alerts.append(f"⏰ GECİKEN: {cari}")
+                    seen.add(cari)
+                continue
+
+            toplam_urun = len(rows)
+            if toplam_urun == 0:
+                continue
+
+            yuksek_adetli = sum(1 for r in rows if (r["adet"] or 0) >= 60)
+            if (yuksek_adetli / toplam_urun) >= 0.70:
+                if cari not in seen:
+                    alerts.append(f"⚠️ GÖZDEN KAÇIRMA: {cari}")
+                    seen.add(cari)
+
+        return alerts
+
+    def render_ticker(self):
+        alerts = self.build_alert_list()
+        msg = "  •  ".join(alerts) if alerts else "Şu an kritik uyarı yok."
+        self.ticker.set_message(msg)
+
+
+
+    # ✅ EKSİK OLAN: çift tıklama (açıklama düzenleme + işaretleme)
+    def on_double_click(self, event):
+        col = self.tree.identify_column(event.x)
+
+        item_id = self.tree.focus()
+        if not item_id:
+            return
+
+        vals = self.tree.item(item_id, "values")
+        if len(vals) < 4:
+            return
+
+        siparis_no = vals[2]
+        stok_kodu = vals[3]
+
+        # Açıklama sütunu (#7) ise açıklama edit
+        if col == "#7":
+            self.edit_aciklama(siparis_no, stok_kodu)
+            return
+
+        # Gözlemci ise hiçbir şey yapma
+        if self.read_only:
+            return
+
+        # İşaretli mi? -> geri almayı teklif et
+        is_done, done_machine = get_item_done_status(siparis_no, stok_kodu)
+        if is_done:
+            if messagebox.askyesno("Geri Al", "Bu satır işaretli.\nİptal etmek (geri almak) ister misin?"):
+                undo_item(siparis_no, stok_kodu)
+                self.refresh_now(silent=True)
+            return
+
+        ok, msg = tick_item(siparis_no, stok_kodu, self.user_fullname, self.role)
+        if not ok and msg != "OK":
+            messagebox.showinfo("Bilgi", msg)
+
+        self.refresh_now(silent=True)
+
+    # ✅ EKSİK OLAN: açıklama penceresi
+    def edit_aciklama(self, siparis_no: str, stok_kodu: str):
+        key = (siparis_no, stok_kodu)
+
+        win = ctk.CTkToplevel(self)
+        win.title("Açıklama Düzenle")
+        win.geometry("420x200")
+        win.grab_set()
+
+        ctk.CTkLabel(win, text="Açıklama:", font=ctk.CTkFont(size=13)).pack(
+            padx=20, pady=(20, 5), anchor="w"
+        )
+
+        txt = ctk.CTkTextbox(win, height=80)
+        txt.pack(padx=20, pady=5, fill="both", expand=True)
+
+        eski = self.aciklamalar.get(key, "")
+        if eski:
+            txt.insert("1.0", eski)
+
+        def kaydet():
+            self.aciklamalar[key] = txt.get("1.0", "end").strip()
+            win.destroy()
+            self.render_table()
+
+        ctk.CTkButton(win, text="Kaydet", command=kaydet).pack(
+            padx=20, pady=15
+        )
+
+
+class App(ctk.CTk):
+    def __init__(self):
+        super().__init__()
+        self.title(APP_TITLE)
+        # pencereyi büyüttük (tablo alanı daha ferah)
+        self.geometry("1400x820")
+        self.minsize(1200, 720)
+
+        ctk.set_appearance_mode("Dark")
+        ctk.set_default_color_theme("blue")
+
+        self.container = ctk.CTkFrame(self)
+        self.container.pack(fill="both", expand=True)
+
+        self.current_view = None
+        self.observer: Optional[Observer] = None
+
+        self.show_login()
+
+        self.observer = start_excel_watcher(self._on_excel_import)
+
+        self.after(600, self.import_existing_excels)
+
+    def _on_excel_import(self, ok: bool, msg: str):
+        def ui():
+            if self.current_view and isinstance(self.current_view, MainView):
+                self.current_view.refresh_now(silent=True)
+        self.after(0, ui)
+
+    def import_existing_excels(self):
+        files = [
+            os.path.join(EXCEL_DIR, f)
+            for f in os.listdir(EXCEL_DIR)
+            if f.lower().endswith((".xlsx", ".xls"))
+        ]
+        for p in files:
+            try:
+                import_excel_file(p)
+            except Exception:
+                pass
+
+    def show_login(self):
+        for w in self.container.winfo_children():
+            w.destroy()
+        self.current_view = LoginView(self.container, self.on_login)
+        self.current_view.pack(fill="both", expand=True, padx=18, pady=18)
+
+    def on_login(self, fullname: str, role: str):
+        for w in self.container.winfo_children():
+            w.destroy()
+        self.current_view = MainView(self.container, fullname, role)
+        self.current_view.pack(fill="both", expand=True)
+
+    def on_closing(self):
+        try:
+            if self.observer:
+                self.observer.stop()
+                self.observer.join(timeout=2)
+        except Exception:
+            pass
+        self.destroy()
+
+
+def main():
+    db_init()
+    app = App()
+    app.protocol("WM_DELETE_WINDOW", app.on_closing)
+    app.mainloop()
+
+
+if __name__ == "__main__":
+    main()
